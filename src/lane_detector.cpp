@@ -1,179 +1,131 @@
+// Lane detection pipeline (OpenCV).
+// Notes:
+// - Tune behavior via ld::LaneDetector::Params in the header.
+// - Coordinates follow image conventions: origin at top-left, y grows downward.
+// - Rendering colors and thicknesses are customizable in Params.
+
 #include "lane_detector.h"
 
-#include <opencv2/imgproc.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/highgui.hpp>
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <deque>
+#include <limits>
+
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace ld
 {
-    // Temporal smoothing history for polynomial coefficients
-    static double g_polySmoothAlpha = 0.9; // [0..1], lower -> stronger smoothing over history
-    static int g_polyHistoryLen = 10;      // history length
-    static std::deque<cv::Vec3d> g_histLeft;
-    static std::deque<cv::Vec3d> g_histRight;
-
-    // Smooth polynomial coefficients over a history buffer
-    static void smoothPolynomials(const cv::Mat &leftLanePoly,
-                                  const cv::Mat &rightLanePoly,
-                                  cv::Mat &leftLanePolySm,
-                                  cv::Mat &rightLanePolySm)
-    {
-        auto matToVec3d = [](const cv::Mat &m) -> cv::Vec3d {
-            return cv::Vec3d(m.at<double>(0,0), m.at<double>(1,0), m.at<double>(2,0));
-        };
-        auto vec3dToMat = [](const cv::Vec3d &v) -> cv::Mat {
-            cv::Mat m(3,1,CV_64F);
-            m.at<double>(0,0) = v[0];
-            m.at<double>(1,0) = v[1];
-            m.at<double>(2,0) = v[2];
-            return m;
-        };
-
-        auto pushWithLimit = [](std::deque<cv::Vec3d> &hist, const cv::Vec3d &val, int maxLen) {
-            if (hist.size() >= static_cast<size_t>(maxLen)) hist.pop_front();
-            hist.push_back(val);
-        };
-
-        auto smoothFromHist = [&](const std::deque<cv::Vec3d> &hist) -> cv::Mat {
-            if (hist.empty()) return cv::Mat();
-            // Exponentially decayed weights favoring newest samples:
-            // newest weight = alpha^0 = 1, previous = alpha^1, ...
-            cv::Vec3d acc(0.0, 0.0, 0.0);
-            double wsum = 0.0;
-            const int n = static_cast<int>(hist.size());
-            for (int idx = 0; idx < n; ++idx)
-            {
-                // access from newest backwards
-                const cv::Vec3d &v = hist[n - 1 - idx];
-                const double w = std::pow(g_polySmoothAlpha, static_cast<double>(idx));
-                acc += w * v;
-                wsum += w;
-            }
-            if (wsum <= 0.0) return cv::Mat();
-            cv::Vec3d sm = acc * (1.0 / wsum);
-            return vec3dToMat(sm);
-        };
-
-        // Update left history if current available
-        if (!leftLanePoly.empty())
-            pushWithLimit(g_histLeft, matToVec3d(leftLanePoly), g_polyHistoryLen);
-        // Update right history if current available
-        if (!rightLanePoly.empty())
-            pushWithLimit(g_histRight, matToVec3d(rightLanePoly), g_polyHistoryLen);
-
-        // Produce smoothed outputs from history (falls back to older frames if current missing)
-        leftLanePolySm = smoothFromHist(g_histLeft);
-        rightLanePolySm = smoothFromHist(g_histRight);
-    }
-
     cv::Mat LaneDetector::processFrame(const cv::Mat &bgrFrame, PipelineDebug *dbg)
     {
         if (bgrFrame.empty())
             return cv::Mat();
 
-        // 1) HLS conversion
+        // Step 1: Convert to HLS.
         cv::Mat hls = convertToHLS(bgrFrame);
 
-        // 1.A) CLAHE on L channel
+        // Step 1A: Apply CLAHE on L channel.
+        // Improves contrast and stabilizes edges under varying lighting.
         std::vector<cv::Mat> ch;
         cv::split(hls, ch);
         cv::Mat L = ch[1];
         cv::Mat L_eq;
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(params_.claheClipLimit, cv::Size(params_.claheTileSize, params_.claheTileSize));
         clahe->apply(L, L_eq);
 
-        // 2) Edge detection
+        // Step 2: Edge detection.
+        // Gaussian blur mitigates noise; Canny finds crisp edges.
         cv::Mat edges = detectEdges(L_eq);
 
-        // 3) ROI mask
-        cv::Mat mask = roiMask(edges.size(), 0.55, 110.0);
+        // Step 3: Apply ROI mask.
+        // Keep lower roiKeepRatio of the frame, optionally cutting sides by roiAngleDeg.
+        cv::Mat mask = roiMask(edges.size(), params_.roiKeepRatio, params_.roiAngleDeg);
         cv::Mat masked;
         cv::bitwise_and(edges, mask, masked);
 
-        // 4) Hough lines
+        // Step 4: Detect Hough lines.
+        // Raw Hough lines are drawn separately for debugging.
         std::vector<cv::Vec4i> hough_lines = detectLines(masked);
         cv::Mat hough_line_img;
         bgrFrame.copyTo(hough_line_img);
-        drawLines(hough_line_img, hough_lines, cv::Scalar(0, 0, 255), 2);
+        drawLines(hough_line_img, hough_lines, params_.colorHoughRaw, params_.lineThickness);
 
-        // 5) Seed lines and classification
-        auto [seedLeft, seedRight] = pickFirstLines(hough_lines, bgrFrame.cols, bgrFrame.rows, 15);
-        // RANSAC filter seeds (x = m*y + c)
-        seedLeft = ransacFilterSeedLines(seedLeft, bgrFrame.rows, 50, 10.0);
-        seedRight = ransacFilterSeedLines(seedRight, bgrFrame.rows, 50, 10.0);
-        auto [leftLines, rightLines] = findAgreeingLines(hough_lines, seedLeft, seedRight);
+        // Step 5: Pick seed lines and classify.
+        // Raycast-based seeds -> optional RANSAC filter -> group agreeing lines.
+        auto [seedLeft, seedRight] = pickFirstLines(hough_lines, bgrFrame.cols, bgrFrame.rows, params_.seedRayCount);
+        seedLeft = ransacFilterSeedLines(seedLeft, bgrFrame.rows, params_.ransacIterations, params_.ransacInlierThreshPx);
+        seedRight = ransacFilterSeedLines(seedRight, bgrFrame.rows, params_.ransacIterations, params_.ransacInlierThreshPx);
+        auto [leftLines, rightLines] = findAgreeingLines(hough_lines, seedLeft, seedRight, params_.agreeSlopeTol, params_.agreeMaxEndpointDist);
         cv::Mat classifiedLines = bgrFrame.clone();
-        drawLines(classifiedLines, leftLines, cv::Scalar(255, 0, 0), 2);
-        drawLines(classifiedLines, rightLines, cv::Scalar(255, 255, 0), 2);
+        drawLines(classifiedLines, leftLines, params_.colorLeftLines, params_.lineThickness);
+        drawLines(classifiedLines, rightLines, params_.colorRightLines, params_.lineThickness);
 
-        // 6) Build lane masks
+        // Step 6: Build lane masks.
+        // Sweep around each line segment perpendicularly and pick edge pixels.
         cv::Mat leftLaneMask = buildLaneMask(masked, leftLines, rightLines);
         cv::Mat rightLaneMask = buildLaneMask(masked, rightLines, leftLines);
 
+        // Overlay masks in color to form a preview layer.
         cv::Mat lanePixels = cv::Mat::zeros(bgrFrame.size(), bgrFrame.type());
-        lanePixels.setTo(cv::Scalar(255, 0, 0), leftLaneMask);
-        lanePixels.setTo(cv::Scalar(255, 255, 0), rightLaneMask);
+        lanePixels.setTo(params_.colorLeftLines, leftLaneMask);
+        lanePixels.setTo(params_.colorRightLines, rightLaneMask);
         cv::addWeighted(lanePixels, 0.5, bgrFrame, 0.5, 0, lanePixels, CV_8U);
 
-        // 7) Fit polynomials
+        // Step 7: Fit polynomials.
+        // We fit x(y) = a*y^2 + b*y + c to account for mild curvature.
         cv::Mat leftLanePoints, rightLanePoints;
-        cv::findNonZero(leftLaneMask, leftLanePoints);   // Nx1, CV_32SC2
-        cv::findNonZero(rightLaneMask, rightLanePoints); // Nx1, CV_32SC2
+        cv::findNonZero(leftLaneMask, leftLanePoints);
+        cv::findNonZero(rightLaneMask, rightLanePoints);
 
         cv::Mat leftLanePoly, rightLanePoly;
-        if (leftLanePoints.rows > 0)
-        {
-            leftLanePoly = fitPolynomial(leftLanePoints);
-        }
-        if (rightLanePoints.rows > 0)
-        {
-            rightLanePoly = fitPolynomial(rightLanePoints);
-        }
+        if (leftLanePoints.rows > 0) leftLanePoly = fitPolynomial(leftLanePoints);
+        if (rightLanePoints.rows > 0) rightLanePoly = fitPolynomial(rightLanePoints);
 
+        // Draw raw fits for inspection.
         cv::Mat raw_poly_img = bgrFrame.clone();
-        const int topY_dbg = static_cast<int>(params_.roiTopY * bgrFrame.rows);
+        const int topY_dbg = static_cast<int>(std::round(bgrFrame.rows - params_.roiKeepRatio * bgrFrame.rows));
         const int bottomY_dbg = bgrFrame.rows - 1;
         if (!leftLanePoly.empty())
         {
             cv::Vec3d abc(leftLanePoly.at<double>(0, 0),
                           leftLanePoly.at<double>(1, 0),
                           leftLanePoly.at<double>(2, 0));
-            drawQuadratic(raw_poly_img, abc, topY_dbg, bottomY_dbg, cv::Scalar(0, 0, 255), 3); // red
+            drawQuadratic(raw_poly_img, abc, topY_dbg, bottomY_dbg, params_.colorLeftPoly, params_.polyThickness);
         }
         if (!rightLanePoly.empty())
         {
             cv::Vec3d abc(rightLanePoly.at<double>(0, 0),
                           rightLanePoly.at<double>(1, 0),
                           rightLanePoly.at<double>(2, 0));
-            drawQuadratic(raw_poly_img, abc, topY_dbg, bottomY_dbg, cv::Scalar(0, 255, 0), 3); // green
+            drawQuadratic(raw_poly_img, abc, topY_dbg, bottomY_dbg, params_.colorRightPoly, params_.polyThickness);
         }
 
-        // 8) Temporal smoothing
+        // Step 8: Temporal smoothing.
+        // Blend current coefficients with a short, exponentially weighted history.
         cv::Mat leftLanePolySm, rightLanePolySm;
         smoothPolynomials(leftLanePoly, rightLanePoly, leftLanePolySm, rightLanePolySm);
 
+        // Draw smoothed fits as final output.
         cv::Mat out = bgrFrame.clone();
         if (!leftLanePolySm.empty())
         {
             cv::Vec3d abc(leftLanePolySm.at<double>(0, 0),
                           leftLanePolySm.at<double>(1, 0),
                           leftLanePolySm.at<double>(2, 0));
-            drawQuadratic(out, abc, topY_dbg, bottomY_dbg, cv::Scalar(0, 0, 255), 3); // red
+            drawQuadratic(out, abc, topY_dbg, bottomY_dbg, params_.colorLeftPoly, params_.polyThickness);
         }
         if (!rightLanePolySm.empty())
         {
             cv::Vec3d abc(rightLanePolySm.at<double>(0, 0),
                           rightLanePolySm.at<double>(1, 0),
                           rightLanePolySm.at<double>(2, 0));
-            drawQuadratic(out, abc, topY_dbg, bottomY_dbg, cv::Scalar(0, 255, 0), 3); // green
+            drawQuadratic(out, abc, topY_dbg, bottomY_dbg, params_.colorRightPoly, params_.polyThickness);
         }
 
         if (dbg)
         {
+            // Collect debug steps in order for UI viewers.
             dbg->steps.clear();
             auto pushStep = [&](const std::string &name, const cv::Mat &img)
             {
@@ -190,7 +142,7 @@ namespace ld
             pushStep("08_smooth_polynoms", out);
         }
 
-        // Keep HighGUI responsive
+        // Keep HighGUI responsive.
         cv::waitKey(1);
 
         return out;
@@ -294,7 +246,8 @@ namespace ld
         return {bestLeftLine, bestRightLine};
     }
 
-    // Raycast-based picking returning lists for left and right
+    // Raycast-based picking: cast N horizontal scanlines across the ROI,
+    // pick the nearest left/right intersection per scanline, deduplicate, and return.
     std::pair<std::vector<cv::Vec4i>, std::vector<cv::Vec4i>>
     LaneDetector::pickFirstLines(const std::vector<cv::Vec4i> &lines,
                                  int imgWidth,
@@ -306,7 +259,7 @@ namespace ld
 
         const double centerX = 0.5 * static_cast<double>(imgWidth);
         const int bottomY = imgHeight - 1;
-        int topY = static_cast<int>(params_.roiTopY * imgHeight);
+        int topY = static_cast<int>(std::round(imgHeight - params_.roiKeepRatio * imgHeight));
         topY = std::max(0, std::min(topY, bottomY));
         const int roiH = bottomY - topY + 1;
 
@@ -392,19 +345,19 @@ namespace ld
         int h = size.height;
         cv::Mat mask = cv::Mat::zeros(size, CV_8UC1);
 
-        // clamp ratio to [0,1]
+        // Clamp ratio to [0, 1].
         if (std::isnan(ratio))
             ratio = 0.0;
         ratio = std::max(0.0, std::min(1.0, ratio));
 
-        // Accept angles > 90°. Normalize to [0, 180) for symmetry around vertical.
+        // Normalize angle to [0, 180).
         if (std::isnan(angleDeg))
             angleDeg = 0.0;
         double angle = std::fmod(angleDeg, 180.0);
         if (angle < 0.0)
             angle += 180.0;
 
-        // Interpret ratio as fraction of image height to keep from the bottom.
+        // Interpret ratio as fraction of image height kept from the bottom.
         int bottomY = h - 1;
         int topY = static_cast<int>(std::round(h - ratio * h));
 
@@ -413,7 +366,7 @@ namespace ld
         if (topY > bottomY)
             topY = bottomY;
 
-        // If angle is 0, fall back to simple rectangle (no side cuts)
+        // If angle is 0, fall back to a rectangle (no side cuts).
         if (angle <= 0.0 || topY >= bottomY)
         {
             cv::rectangle(mask, cv::Point(0, topY), cv::Point(w - 1, bottomY), cv::Scalar(255), cv::FILLED);
@@ -425,7 +378,7 @@ namespace ld
         const double dy = static_cast<double>(bottomY - topY);
         const double alpha = angle * CV_PI / 180.0;
 
-        // Handle near-90° safely
+        // Handle near-90° safely by pushing corners far off-image (avoids tan blow-ups).
         double dx;
         const double cosA = std::cos(alpha);
         if (std::abs(cosA) < 1e-9)
@@ -444,7 +397,7 @@ namespace ld
             }
         }
 
-        // Do not clamp base intersections; let polygon extend off-image
+        // Do not clamp base intersections; allow polygon to extend off-image
         int xLeft = static_cast<int>(std::llround(cx - dx));
         int xRight = static_cast<int>(std::llround(cx + dx));
         if (xLeft > xRight)
@@ -466,16 +419,16 @@ namespace ld
         cv::HoughLinesP(edges, lines, params_.houghRho, params_.houghTheta, params_.houghThreshold,
                         params_.houghMinLineLength, params_.houghMaxLineGap);
 
-        // filter out nearly horizontal lines
+        // Filter out nearly horizontal lines (lanes are typically slanted in image space).
         lines.erase(std::remove_if(lines.begin(), lines.end(),
-                                   [](const cv::Vec4i &l)
+                                   [&](const cv::Vec4i &l)
                                    {
                                        double dx = static_cast<double>(l[2] - l[0]);
                                        double dy = static_cast<double>(l[3] - l[1]);
                                        if (std::abs(dx) < 1e-6)
-                                           return false; // keep vertical lines
+                                           return false; // Keep vertical lines.
                                        double slope = dy / dx;
-                                       return std::abs(slope) < 0.3; // filter near-horizontal
+                                       return std::abs(slope) < params_.minAbsSlopeFilter;
                                    }),
                     lines.end());
 
@@ -503,8 +456,9 @@ namespace ld
     {
         if (seedLines.empty())
             return {};
-        std::vector<cv::Vec4i> out = seedLines; // grow set transitively
+        std::vector<cv::Vec4i> out = seedLines; // Grow set transitively.
 
+        // Compare slope similarity and endpoint proximity to expand clusters.
         auto slopeOf = [](const cv::Vec4i &l)
         {
             return static_cast<double>(l[3] - l[1]) / (static_cast<double>(l[2] - l[0]) + 1e-6);
@@ -523,7 +477,7 @@ namespace ld
         for (const auto &l : houghLines)
         {
             double k = slopeOf(l);
-            // compare against current accumulated lines; if agrees with any, add it
+            // Compare against current accumulated lines; if it agrees with any, add it.
             for (const auto &ref : out)
             {
                 double kr = slopeOf(ref);
@@ -552,10 +506,10 @@ namespace ld
 
     void LaneDetector::drawQuadratic(cv::Mat &img, const cv::Vec3d &abc, int topY, int bottomY, const cv::Scalar &color, int thickness)
     {
-        auto xOfY = [&](double y)
-        { return abc[0] * y * y + abc[1] * y + abc[2]; };
+        // Draw x(y) curve from bottom to top to minimize visual gaps.
+        auto xOfY = [&](double y) { return abc[0] * y * y + abc[1] * y + abc[2]; };
 
-        // Clamp to image bounds
+        // Clamp to image bounds.
         if (img.empty())
             return;
         topY = std::max(0, topY);
@@ -576,6 +530,7 @@ namespace ld
             }
             else
             {
+                // Reset when out of bounds.
                 prev = {-1, -1};
             }
         }
@@ -585,11 +540,11 @@ namespace ld
                                         const std::vector<cv::Vec4i> &leftLines,
                                         const std::vector<cv::Vec4i> &rightLines)
     {
-        (void)rightLines; // unused by design; mask is built from the provided 'lines' set
+        (void)rightLines; // Currently unused. Extend to fuse both sides if needed.
 
         cv::Mat leftLaneMask = cv::Mat::zeros(maskedEdges.size(), CV_8UC1);
-        const int kernelHalf = 7;
-        const int sampleStep = 2;
+        const int kernelHalf = params_.laneKernelHalf;
+        const int sampleStep = params_.laneSampleStep;
 
         auto accumulateFromLines = [&](const std::vector<cv::Vec4i> &lines, cv::Mat &dstMask)
         {
@@ -604,8 +559,8 @@ namespace ld
 
                 double ux = dx / length;
                 double uy = dy / length;
-                double px = -uy; // perpendicular
-                double py = ux;
+                double px = -uy; // Perpendicular unit vector (x).
+                double py = ux;  // Perpendicular unit vector (y).
 
                 for (int s = 0; s <= static_cast<int>(length); s += sampleStep)
                 {
@@ -629,11 +584,13 @@ namespace ld
             }
         };
 
+        // Accumulate from left-side lines.
         accumulateFromLines(leftLines, leftLaneMask);
 
+        // Post-process to make the mask more continuous.
         if (!leftLaneMask.empty())
         {
-            int dilateK = 5;
+            int dilateK = params_.laneDilateK;
             cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(dilateK, dilateK));
             cv::dilate(leftLaneMask, leftLaneMask, kern);
         }
@@ -731,7 +688,55 @@ namespace ld
         return coeffs;
     }
 
-    // RANSAC-like filtering of seed lines using x = m*y + c model
+    void LaneDetector::smoothPolynomials(const cv::Mat &leftLanePoly,
+                                         const cv::Mat &rightLanePoly,
+                                         cv::Mat &leftLanePolySm,
+                                         cv::Mat &rightLanePolySm)
+    {
+        auto matToVec3d = [](const cv::Mat &m) -> cv::Vec3d {
+            return cv::Vec3d(m.at<double>(0,0), m.at<double>(1,0), m.at<double>(2,0));
+        };
+        auto vec3dToMat = [](const cv::Vec3d &v) -> cv::Mat {
+            cv::Mat m(3,1,CV_64F);
+            m.at<double>(0,0) = v[0];
+            m.at<double>(1,0) = v[1];
+            m.at<double>(2,0) = v[2];
+            return m;
+        };
+
+        auto pushWithLimit = [](std::deque<cv::Vec3d> &hist, const cv::Vec3d &val, int maxLen) {
+            if (hist.size() >= static_cast<size_t>(maxLen)) hist.pop_front();
+            hist.push_back(val);
+        };
+
+        auto smoothFromHist = [&](const std::deque<cv::Vec3d> &hist) -> cv::Mat {
+            if (hist.empty()) return cv::Mat();
+            cv::Vec3d acc(0.0, 0.0, 0.0);
+            double wsum = 0.0;
+            const int n = static_cast<int>(hist.size());
+            for (int idx = 0; idx < n; ++idx)
+            {
+                const cv::Vec3d &v = hist[n - 1 - idx];
+                const double w = std::pow(polySmoothAlpha_, static_cast<double>(idx));
+                acc += w * v;
+                wsum += w;
+            }
+            if (wsum <= 0.0) return cv::Mat();
+            cv::Vec3d sm = acc * (1.0 / wsum);
+            return vec3dToMat(sm);
+        };
+
+        if (!leftLanePoly.empty())
+            pushWithLimit(histLeft_, matToVec3d(leftLanePoly), polyHistoryLen_);
+        if (!rightLanePoly.empty())
+            pushWithLimit(histRight_, matToVec3d(rightLanePoly), polyHistoryLen_);
+
+        leftLanePolySm = smoothFromHist(histLeft_);
+        rightLanePolySm = smoothFromHist(histRight_);
+    }
+
+    // RANSAC-like filtering of seed lines using x = m*y + c.
+    // Deterministic variant: test each seed as hypothesis and keep largest inlier set.
     std::vector<cv::Vec4i>
     LaneDetector::ransacFilterSeedLines(const std::vector<cv::Vec4i> &seeds,
                                         int imgHeight,
@@ -762,7 +767,7 @@ namespace ld
         std::vector<int> bestInliers;
         bestInliers.reserve(seeds.size());
 
-        // Deterministic "basic RANSAC": try each seed as hypothesis
+        // Deterministic RANSAC: try each seed as hypothesis.
         for (int h = 0; h < static_cast<int>(seeds.size()); ++h) {
             double m = 0.0, c = 0.0;
             if (!lineToMC(seeds[h], m, c)) continue;
