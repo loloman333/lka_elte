@@ -1,0 +1,31 @@
+services:
+  app:
+    # Use a prebuilt image that already contains OpenCV and a C++ toolchain (g++, make, pkg-config).
+    # You can override OPENCV_CPP_IMAGE in a .env file or your shell.
+    image: ${OPENCV_CPP_IMAGE:-matimoreyra/opencv:latest}
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    environment:
+      - DISPLAY=${DISPLAY}
+      - PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig
+      - LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+    # If the image includes build tools, this will compile and run in one shot.
+    # Provide a video path via env var VIDEO or fallback to /app/data/sample.mp4
+    # command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector \"${VIDEO:-/app/data/curvy.mp4}\" "]
+    # command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector \"${VIDEO:-/app/data/with_cars.mp4}\" "]
+    command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector \"${VIDEO:-/app/data/test_video.mp4}\" "]
+
+# Notes:
+# - On Linux/X11, run `xhost +local:root` once to allow GUI from containers.
+# - The default image is a placeholder; set OPENCV_CPP_IMAGE to a known-good image which includes:
+#   - OpenCV C++ dev libs (headers and .so)
+#   - g++, make, pkg-config
+# - Examples to try (verify availability/tags):
+#   - jitesoft/opencv:4.9.0-ubuntu (often includes dev libs/tools)
+#   - a custom internal image your team maintains
+
+volumes:
+  vscode-server:
+  ccache:

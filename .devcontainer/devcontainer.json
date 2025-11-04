@@ -1,0 +1,29 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
+// https://github.com/microsoft/vscode-dev-containers/tree/v0.245.2/containers/docker-existing-dockerfile
+{
+  "name": "CV Devcontainer",
+  "build": {
+		// Sets the run context to one level up instead of the .devcontainer folder.
+		"context": "..",
+		"dockerfile": "../Dockerfile",
+    "args": {
+      "BUILDKIT_INLINE_CACHE": "0"
+    }
+	},
+  "runArgs": [
+    "--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+    "-e=DISPLAY"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.cpptools-themes",
+        "twxs.cmake",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.makefile-tools"
+      ]
+    }
+  }
+}
