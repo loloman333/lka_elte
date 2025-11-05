@@ -92,6 +92,7 @@ Windows and Linux are supported. Video writers attempt H.264 (`avc1`) then fall 
 
 ## 4) Lane Detection Pipeline
 
+```mermaid
 flowchart TD
     A[1. Convert to HLS] --> A1[1A. Apply CLAHE on L channel]
     A1 --> B[2. Edge Detection]
@@ -133,7 +134,7 @@ flowchart TD
     subgraph Step8[Step 8: Temporal & Output]
         H
     end
-
+```
 
 **Step 1 – Convert to HLS**  
 - Convert the input BGR frame to HLS color space.  
