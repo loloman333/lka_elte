@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <opencv2/core.hpp>
+#include <fstream>
 
 namespace ld
 {
@@ -57,8 +58,8 @@ namespace ld
             int seedRayCount = 15;
 
             // Line agreement grouping thresholds.
-            double agreeSlopeTol = 0.2;
-            double agreeMaxEndpointDist = 10.0;
+            double agreeSlopeTol = 0.15;
+            double agreeMaxEndpointDist = 8.0;
 
             // Hough line post-filter (reject near-horizontal).
             double minAbsSlopeFilter = 0.3;
@@ -66,16 +67,51 @@ namespace ld
             // Rendering styles.
             int lineThickness = 2;
             int polyThickness = 3;
-            cv::Scalar colorHoughRaw = cv::Scalar(0, 0, 255);   // Red lines over masked edges.
-            cv::Scalar colorLeftLines = cv::Scalar(255, 0, 0);  // Blue for left lane clusters.
-            cv::Scalar colorRightLines = cv::Scalar(255, 255, 0); // Cyan for right lane clusters.
-            cv::Scalar colorLeftPoly = cv::Scalar(0, 0, 255);   // Red fitted left curve.
-            cv::Scalar colorRightPoly = cv::Scalar(0, 255, 0);  // Green fitted right curve.
+            cv::Scalar colorHoughRaw = cv::Scalar(0, 0, 255);      // Red lines over masked edges.
+            cv::Scalar colorLeftLines = cv::Scalar(0, 255, 0);     // Green for left lane clusters.
+            cv::Scalar colorRightLines = cv::Scalar(255, 0, 0);    // Blue for right lane clusters.
+            cv::Scalar colorLeftPoly = cv::Scalar(0, 255, 0);      // Left = green polyline
+            cv::Scalar colorRightPoly = cv::Scalar(255, 0, 0);     // Right = blue polyline
+            cv::Scalar colorDashedUnknown = cv::Scalar(160, 160, 160); // Dashed gray when not detected
 
             // Lane mask shaping around detected lines.
             int laneKernelHalf = 7;  // Half-width of the perpendicular sweep.
             int laneSampleStep = 2;  // Step along the line when sampling.
             int laneDilateK = 5;     // Final dilation to connect sparse pixels.
+
+            // Confidence and dashed styling.
+            double confidenceThresh = 0.35; // Liberal threshold for YES/NO
+            int dashLenPx = 12;
+            int gapLenPx = 8;
+
+            // HUD styling.
+            cv::Scalar hudTextColor = cv::Scalar(255, 255, 255);
+            cv::Scalar hudShadowColor = cv::Scalar(0, 0, 0);
+            double hudFontScale = 0.6;
+            int hudThickness = 1;
+            cv::Scalar hudBgColor = cv::Scalar(0, 0, 0); // semi-transparent background box
+            double hudBgAlpha = 0.4;                     // [0..1]
+            int hudPadding = 6;                          // px
+
+            // Confidence estimator tuning (lightweight).
+            int confSupportBandHalf = 6;      // Half-band around x(y) to search mask support.
+            int confSupportSampleStep = 5;    // Row sampling step for coverage/stability checks.
+            double confSlopeStdRef = 0.25;    // Reference slope std for exp decay mapping.
+            double confStabilityRefPx = 10.0; // ~10px deviation yields ~e^-1 drop.
+            double confCurvatureRef = 2e-6;   // Reference |a| for curvature penalty (x = a*y^2 + ...).
+
+            // Feature weights (sum ~= 1.0).
+            double confWMask = 0.35;
+            double confWLines = 0.25;
+            double confWSlope = 0.25;
+            double confWCoverage = 0.40;
+            double confWStability = 0.20;
+            double confWCurvature = 0.15;
+
+            // CSV export (empty path disables).
+            std::string csvOutputPath = "output/metrics.csv"; // e.g. "/tmp/lane_metrics.csv"
+            bool csvAppend = false;         // append if true, otherwise truncate
+            bool csvWriteHeader = true;     // write header when not appending
         };
 
         LaneDetector() = default;
@@ -113,6 +149,10 @@ namespace ld
         // Polynomial fitting and drawing.
         bool fitQuadraticXY(const std::vector<cv::Point> &points, cv::Vec3d &coeffs); // x = a*y^2 + b*y + c.
         void drawQuadratic(cv::Mat &img, const cv::Vec3d &abc, int topY, int bottomY, const cv::Scalar &color, int thickness = 3);
+        void drawQuadraticDashed(cv::Mat &img, const cv::Vec3d &abc, int topY, int bottomY,
+                                 const cv::Scalar &color, int thickness, int dashLen, int gapLen);
+        void drawVerticalDashed(cv::Mat &img, int x, int topY, int bottomY,
+                                const cv::Scalar &color, int thickness, int dashLen, int gapLen);
         cv::Mat fitPolynomial(const cv::Mat &points); // Returns [a, b, c]^T for x = a*y^2 + b*y + c.
 
         // Group Hough lines that agree with seed left/right lines.
@@ -146,10 +186,30 @@ namespace ld
                                cv::Mat &rightLanePolySm);
 
         // Temporal smoothing parameters and history.
-        double polySmoothAlpha_ = 0.9; // [0..1], lower means stronger smoothing over history.
-        int polyHistoryLen_ = 10;      // History length.
+        double polySmoothAlpha_ = 0.95; // [0..1], lower means stronger smoothing over history.
+        int polyHistoryLen_ = 20;      // History length.
         std::deque<cv::Vec3d> histLeft_;
         std::deque<cv::Vec3d> histRight_;
+
+        // Confidence estimation [0..1] for a side.
+        double estimateLaneConfidence(const cv::Mat &laneMask,
+                                      const std::vector<cv::Vec4i> &agreeingLines,
+                                      const cv::Mat &poly,
+                                      const cv::Size &imgSize,
+                                      bool isLeft);
+
+        // HUD overlay.
+        void drawHUD(cv::Mat &img,
+                     bool leftDetected, bool rightDetected,
+                     double confLeft, double confRight);
+
+        // CSV helpers and state.
+        int frameId_ = 0;
+        std::ofstream csv_;
+        bool csvHeaderWritten_ = false;
+        bool ensureCsvOpened();
+        void writeCsvHeader();
+        void writeCsvRow(int frameId, bool leftDetected, bool rightDetected, double confLeft, double confRight);
     };
 
 }; // namespace ld

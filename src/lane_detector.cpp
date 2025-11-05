@@ -10,6 +10,8 @@
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <sstream>
+#include <fstream>
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -108,20 +110,67 @@ namespace ld
 
         // Draw smoothed fits as final output.
         cv::Mat out = bgrFrame.clone();
-        if (!leftLanePolySm.empty())
+
+        // Confidence estimation (more conservative).
+        const cv::Mat leftPolyForEval = (!leftLanePolySm.empty() ? leftLanePolySm : leftLanePoly);
+        const cv::Mat rightPolyForEval = (!rightLanePolySm.empty() ? rightLanePolySm : rightLanePoly);
+        const double confLeft = estimateLaneConfidence(leftLaneMask, leftLines, leftPolyForEval, out.size(), /*isLeft=*/true);
+        const double confRight = estimateLaneConfidence(rightLaneMask, rightLines, rightPolyForEval, out.size(), /*isLeft=*/false);
+        const bool leftDetected = confLeft >= params_.confidenceThresh;
+        const bool rightDetected = confRight >= params_.confidenceThresh;
+
+        // CSV: one row per frame
+        if (ensureCsvOpened())
         {
-            cv::Vec3d abc(leftLanePolySm.at<double>(0, 0),
-                          leftLanePolySm.at<double>(1, 0),
-                          leftLanePolySm.at<double>(2, 0));
-            drawQuadratic(out, abc, topY_dbg, bottomY_dbg, params_.colorLeftPoly, params_.polyThickness);
+            if (!csvHeaderWritten_ && params_.csvWriteHeader && !params_.csvAppend)
+                writeCsvHeader();
+            writeCsvRow(frameId_, leftDetected, rightDetected, confLeft, confRight);
+            ++frameId_;
         }
-        if (!rightLanePolySm.empty())
+
+        // Draw final overlays:
+        // - Solid colored poly if detected.
+        // - Dashed gray poly (or dashed vertical fallback) if not detected.
+        auto drawSide = [&](const cv::Mat &poly, bool detected, const cv::Scalar &solidColor, bool isLeft)
         {
-            cv::Vec3d abc(rightLanePolySm.at<double>(0, 0),
-                          rightLanePolySm.at<double>(1, 0),
-                          rightLanePolySm.at<double>(2, 0));
-            drawQuadratic(out, abc, topY_dbg, bottomY_dbg, params_.colorRightPoly, params_.polyThickness);
-        }
+            const int topY = topY_dbg;
+            const int bottomY = bottomY_dbg;
+            if (detected && !poly.empty())
+            {
+                cv::Vec3d abc(poly.at<double>(0, 0),
+                              poly.at<double>(1, 0),
+                              poly.at<double>(2, 0));
+                drawQuadratic(out, abc, topY, bottomY, solidColor, params_.polyThickness);
+            }
+            else
+            {
+                if (!poly.empty())
+                {
+                    cv::Vec3d abc(poly.at<double>(0, 0),
+                                  poly.at<double>(1, 0),
+                                  poly.at<double>(2, 0));
+                    drawQuadraticDashed(out, abc, topY, bottomY,
+                                        params_.colorDashedUnknown, params_.polyThickness,
+                                        params_.dashLenPx, params_.gapLenPx);
+                }
+                else
+                {
+                    // Fallback dashed vertical guide at 1/4 or 3/4 width.
+                    int x = isLeft ? static_cast<int>(out.cols * 0.25) : static_cast<int>(out.cols * 0.75);
+                    drawVerticalDashed(out, x, topY, bottomY,
+                                       params_.colorDashedUnknown, params_.polyThickness,
+                                       params_.dashLenPx, params_.gapLenPx);
+                }
+            }
+        };
+
+        drawSide(leftLanePolySm.empty() ? leftLanePoly : leftLanePolySm,
+                 leftDetected, params_.colorLeftPoly, /*isLeft=*/true);
+        drawSide(rightLanePolySm.empty() ? rightLanePoly : rightLanePolySm,
+                 rightDetected, params_.colorRightPoly, /*isLeft=*/false);
+
+        // HUD
+        drawHUD(out, leftDetected, rightDetected, confLeft, confRight);
 
         if (dbg)
         {
@@ -536,6 +585,70 @@ namespace ld
         }
     }
 
+    void LaneDetector::drawQuadraticDashed(cv::Mat &img, const cv::Vec3d &abc, int topY, int bottomY,
+                                           const cv::Scalar &color, int thickness, int dashLen, int gapLen)
+    {
+        if (img.empty()) return;
+        topY = std::max(0, topY);
+        bottomY = std::min(img.rows - 1, bottomY);
+        if (bottomY < topY) std::swap(bottomY, topY);
+
+        auto xOfY = [&](double y) { return abc[0] * y * y + abc[1] * y + abc[2]; };
+
+        int run = 0;
+        bool drawOn = true; // start with dash
+        cv::Point prev(-1, -1);
+
+        for (int y = bottomY; y >= topY; --y)
+        {
+            int xi = static_cast<int>(std::round(xOfY(y)));
+            cv::Point p(xi, y);
+
+            if (xi >= 0 && xi < img.cols)
+            {
+                if (prev.x >= 0 && drawOn)
+                    cv::line(img, prev, p, color, thickness, cv::LINE_AA);
+                prev = p;
+                run++;
+            }
+            else
+            {
+                prev = {-1, -1};
+                // Do not count out-of-bounds into dash run to keep cadence stable on-screen.
+            }
+
+            // toggle dash/gap based on vertical step count
+            int segLen = drawOn ? dashLen : gapLen;
+            if (run >= segLen)
+            {
+                drawOn = !drawOn;
+                run = 0;
+            }
+        }
+    }
+
+    void LaneDetector::drawVerticalDashed(cv::Mat &img, int x, int topY, int bottomY,
+                                          const cv::Scalar &color, int thickness, int dashLen, int gapLen)
+    {
+        if (img.empty()) return;
+        x = std::max(0, std::min(img.cols - 1, x));
+        topY = std::max(0, topY);
+        bottomY = std::min(img.rows - 1, bottomY);
+        if (bottomY < topY) std::swap(bottomY, topY);
+
+        bool drawOn = true;
+        int y = bottomY;
+        while (y >= topY)
+        {
+            int seg = drawOn ? dashLen : gapLen;
+            int y2 = std::max(topY, y - seg + 1);
+            if (drawOn)
+                cv::line(img, cv::Point(x, y), cv::Point(x, y2), color, thickness, cv::LINE_AA);
+            drawOn = !drawOn;
+            y = y2 - 1;
+        }
+    }
+
     cv::Mat LaneDetector::buildLaneMask(const cv::Mat &maskedEdges,
                                         const std::vector<cv::Vec4i> &leftLines,
                                         const std::vector<cv::Vec4i> &rightLines)
@@ -733,6 +846,225 @@ namespace ld
 
         leftLanePolySm = smoothFromHist(histLeft_);
         rightLanePolySm = smoothFromHist(histRight_);
+    }
+
+    double LaneDetector::estimateLaneConfidence(const cv::Mat &laneMask,
+                                                const std::vector<cv::Vec4i> &agreeingLines,
+                                                const cv::Mat &poly,
+                                                const cv::Size &imgSize,
+                                                bool isLeft)
+    {
+        auto clamp01 = [](double v) { return std::max(0.0, std::min(1.0, v)); };
+
+        // 1) Global mask density (saturates around ~1% of image area).
+        double fMask = 0.0;
+        if (!laneMask.empty())
+        {
+            const int nz = cv::countNonZero(laneMask);
+            const double norm = 0.01 * static_cast<double>(imgSize.area()); // ~1% of pixels
+            fMask = clamp01(nz / std::max(1.0, norm));
+        }
+
+        // 2) Number of agreeing Hough lines (saturates quickly).
+        double fLines = clamp01(static_cast<double>(agreeingLines.size()) / 6.0);
+
+        // 3) Slope consistency: lower stddev -> higher confidence.
+        double fSlope = 0.0;
+        if (agreeingLines.size() >= 2)
+        {
+            std::vector<double> slopes;
+            slopes.reserve(agreeingLines.size());
+            for (const auto &l : agreeingLines)
+            {
+                double dx = static_cast<double>(l[2] - l[0]);
+                double dy = static_cast<double>(l[3] - l[1]);
+                if (std::abs(dx) < 1e-6)
+                    continue; // treat near-vertical as very large slope; skip to avoid blow-up
+                slopes.push_back(dy / dx);
+            }
+            if (slopes.size() >= 2)
+            {
+                double mean = 0.0;
+                for (double s : slopes) mean += s;
+                mean /= static_cast<double>(slopes.size());
+                double var = 0.0;
+                for (double s : slopes) var += (s - mean) * (s - mean);
+                var /= static_cast<double>(slopes.size() - 1);
+                double sd = std::sqrt(std::max(0.0, var));
+                fSlope = std::exp(-sd / std::max(1e-6, params_.confSlopeStdRef));
+                fSlope = clamp01(fSlope);
+            }
+        }
+
+        // Poly unpack helpers.
+        auto hasPoly = [&]() { return !poly.empty() && poly.rows >= 3 && poly.cols >= 1; };
+        auto polyABC = [&]() -> cv::Vec3d {
+            return cv::Vec3d(poly.at<double>(0,0), poly.at<double>(1,0), poly.at<double>(2,0));
+        };
+
+        // ROI vertical range.
+        int bottomY = imgSize.height - 1;
+        int topY = static_cast<int>(std::round(imgSize.height - params_.roiKeepRatio * imgSize.height));
+        topY = std::max(0, std::min(topY, bottomY));
+
+        // 4) Coverage along the curve: fraction of sampled rows with mask support near x(y).
+        double fCoverage = 0.0;
+        if (hasPoly() && !laneMask.empty())
+        {
+            const cv::Vec3d abc = polyABC();
+            auto xOfY = [&](double y) { return abc[0] * y * y + abc[1] * y + abc[2]; };
+
+            int valid = 0, supported = 0;
+            for (int y = bottomY; y >= topY; y -= std::max(1, params_.confSupportSampleStep))
+            {
+                int xi = static_cast<int>(std::llround(xOfY(static_cast<double>(y))));
+                if (xi < 0 || xi >= laneMask.cols) continue;
+                ++valid;
+
+                int half = std::max(0, params_.confSupportBandHalf);
+                int xl = std::max(0, xi - half);
+                int xr = std::min(laneMask.cols - 1, xi + half);
+                const uchar* row = laneMask.ptr<uchar>(y);
+                bool any = false;
+                for (int x = xl; x <= xr; ++x)
+                {
+                    if (row[x] != 0) { any = true; break; }
+                }
+                if (any) ++supported;
+            }
+            fCoverage = (valid > 0) ? static_cast<double>(supported) / static_cast<double>(valid) : 0.0;
+            fCoverage = clamp01(fCoverage);
+        }
+
+        // 5) Temporal stability vs. last smoothed polynomial for this side.
+        double fStability = 0.0;
+        if (hasPoly())
+        {
+            const auto &hist = isLeft ? histLeft_ : histRight_;
+            if (!hist.empty())
+            {
+                cv::Vec3d cur = polyABC();
+                cv::Vec3d prev = hist.back();
+                cv::Vec3d d = cur - prev;
+
+                // Approximate pixel deviation across ROI with three samples.
+                auto xOf = [&](const cv::Vec3d &c, double y) { return c[0]*y*y + c[1]*y + c[2]; };
+                double yT = static_cast<double>(topY);
+                double yM = 0.5 * (static_cast<double>(topY) + static_cast<double>(bottomY));
+                double yB = static_cast<double>(bottomY);
+                double eT = std::abs(xOf(d, yT));
+                double eM = std::abs(xOf(d, yM));
+                double eB = std::abs(xOf(d, yB));
+                double ePx = (eT + eM + eB) / 3.0;
+
+                fStability = std::exp(-ePx / std::max(1e-6, params_.confStabilityRefPx));
+                fStability = clamp01(fStability);
+            }
+        }
+
+        // 6) Curvature penalty: large |a| reduces confidence.
+        double fCurvature = 0.0;
+        if (hasPoly())
+        {
+            double a = std::abs(poly.at<double>(0,0));
+            fCurvature = std::exp(-a / std::max(1e-12, params_.confCurvatureRef));
+            fCurvature = clamp01(fCurvature);
+        }
+
+        // Weighted combination (normalize weights sum if needed).
+        const double wSum =
+            params_.confWMask + params_.confWLines + params_.confWSlope +
+            params_.confWCoverage + params_.confWStability + params_.confWCurvature;
+        const double invWSum = (wSum > 0.0) ? (1.0 / wSum) : 1.0;
+
+        double conf =
+            params_.confWMask * fMask +
+            params_.confWLines * fLines +
+            params_.confWSlope * fSlope +
+            params_.confWCoverage * fCoverage +
+            params_.confWStability * fStability +
+            params_.confWCurvature * fCurvature;
+
+        conf *= invWSum;
+        conf += 0.1;
+        return clamp01(conf);
+    }
+
+    void LaneDetector::drawHUD(cv::Mat &img,
+                               bool leftDetected, bool rightDetected,
+                               double confLeft, double confRight)
+    {
+        if (img.empty()) return;
+
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss.precision(2);
+        oss << "Left: " << (leftDetected ? "YES" : "NO")
+            <<  " Conf: " << confLeft
+            << " | Right: " << (rightDetected ? "YES" : "NO")
+            << " Conf: " << confRight;
+
+        const std::string text = oss.str();
+        const int font = cv::FONT_HERSHEY_SIMPLEX;
+        const double scale = params_.hudFontScale;
+        const int thick = params_.hudThickness;
+
+        int baseline = 0;
+        cv::Size sz = cv::getTextSize(text, font, scale, thick, &baseline);
+        cv::Point org(10, 10 + sz.height);
+
+        // Semi-transparent background box
+        const int pad = std::max(0, params_.hudPadding);
+        cv::Point tl(std::max(0, org.x - pad), std::max(0, org.y - sz.height - pad));
+        cv::Point br(std::min(img.cols - 1, org.x + sz.width + pad), std::min(img.rows - 1, org.y + baseline + pad));
+        cv::Rect box(tl, br);
+
+        cv::Mat overlay = img.clone();
+        cv::rectangle(overlay, box, params_.hudBgColor, cv::FILLED);
+        const double alpha = std::max(0.0, std::min(1.0, params_.hudBgAlpha));
+        cv::addWeighted(overlay, alpha, img, 1.0 - alpha, 0.0, img);
+
+        // Foreground text (no shadow)
+        cv::putText(img, text, org, font, scale, params_.hudTextColor, thick, cv::LINE_AA);
+    }
+
+    // CSV helpers
+    bool LaneDetector::ensureCsvOpened()
+    {
+        if (params_.csvOutputPath.empty())
+            return false;
+        if (csv_.is_open())
+            return true;
+
+        std::ios::openmode mode = std::ios::out;
+        mode |= params_.csvAppend ? std::ios::app : std::ios::trunc;
+        csv_.open(params_.csvOutputPath, mode);
+        csv_.setf(std::ios::fixed);
+        csv_.precision(2);
+
+        // If appending, assume header already exists (avoid duplicate headers).
+        if (params_.csvAppend) csvHeaderWritten_ = true;
+
+        return csv_.good();
+    }
+
+    void LaneDetector::writeCsvHeader()
+    {
+        if (!csv_.is_open() || csvHeaderWritten_) return;
+        csv_ << "frame_id,left_detected,right_detected,left_conf,right_conf\n";
+        csvHeaderWritten_ = true;
+        csv_.flush();
+    }
+
+    void LaneDetector::writeCsvRow(int frameId, bool leftDetected, bool rightDetected, double confLeft, double confRight)
+    {
+        if (!csv_.is_open()) return;
+        csv_ << frameId << ','
+             << (leftDetected ? 1 : 0) << ','
+             << (rightDetected ? 1 : 0) << ','
+             << confLeft << ','
+             << confRight << '\n';
+        csv_.flush();
     }
 
     // RANSAC-like filtering of seed lines using x = m*y + c.

@@ -17,8 +17,26 @@ using namespace ld;
 
 int main(int argc, char **argv) {
     std::string source;
-    if (argc > 1) {
-        source = argv[1];
+    bool enableDebug = true;   // --no-debug or --fast disables this
+    int stride = 1;            // --stride=N or implied by --fast
+    double scale = 1.0;        // --scale=F or implied by --fast
+
+    // Parse args: first non-flag is source; flags can appear in any order
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--no-debug") {
+            enableDebug = false;
+        } else if (arg == "--fast") {
+            enableDebug = false;
+            stride = 2;
+            scale = 0.5;
+        } else if (arg.rfind("--scale=", 0) == 0) {
+            try { scale = std::max(0.05, std::stod(arg.substr(8))); } catch (...) {}
+        } else if (arg.rfind("--stride=", 0) == 0) {
+            try { stride = std::max(1, std::stoi(arg.substr(9))); } catch (...) {}
+        } else if (source.empty()) {
+            source = arg;
+        }
     }
 
     cv::VideoCapture cap;
@@ -37,28 +55,47 @@ int main(int argc, char **argv) {
     LaneDetector::Params params;
     LaneDetector detector(params);
 
-    cv::namedWindow("Lane Detector", cv::WINDOW_NORMAL);
-    cv::namedWindow("Debug", cv::WINDOW_NORMAL);
-
-    bool showCrosshair = false; // toggle with 'o'
-
     // Prepare writers for each step
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    if (fps <= 0 || std::isnan(fps)) fps = 25.0;
+    double srcFps = cap.get(cv::CAP_PROP_FPS);
+    if (srcFps <= 0 || std::isnan(srcFps)) srcFps = 25.0;
+    double writerFps = srcFps / std::max(1, stride);
     int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
     int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-    cv::Size frameSize(width > 0 ? width : 1280, height > 0 ? height : 720);
+    cv::Size baseSize(width > 0 ? width : 1280, height > 0 ? height : 720);
+    cv::Size frameSize(
+        std::max(1, static_cast<int>(baseSize.width * scale + 0.5)),
+        std::max(1, static_cast<int>(baseSize.height * scale + 0.5))
+    );
     int fourcc = cv::VideoWriter::fourcc('a','v','c','1'); // H.264 if available; else fallback below
 
     auto safeWriter = [&](const std::string &path, bool isColor) {
         cv::VideoWriter w;
-        if (!w.open(path, fourcc, fps, frameSize, isColor)) {
+        if (!w.open(path, fourcc, writerFps, frameSize, isColor)) {
             // fallback to mp4v
             int f2 = cv::VideoWriter::fourcc('m','p','4','v');
-            w.open(path, f2, fps, frameSize, isColor);
+            w.open(path, f2, writerFps, frameSize, isColor);
         }
         return w;
     };
+
+    // Create UI windows with sensible default sizes (after frameSize is known)
+    {
+        int minW = 960, minH = 540;
+        cv::namedWindow("Lane Detector", cv::WINDOW_NORMAL);
+        cv::resizeWindow("Lane Detector",
+                         std::max(frameSize.width,  minW),
+                         std::max(frameSize.height, minH));
+
+        if (enableDebug) {
+            cv::namedWindow("Debug", cv::WINDOW_NORMAL);
+            // Debug mosaic tends to be larger; give it more room by default.
+            cv::resizeWindow("Debug",
+                             std::max(frameSize.width  * 2, minW),
+                             std::max(frameSize.height * 2, minH));
+            // Optional: place Debug to the right of the main window
+            // cv::moveWindow("Debug", std::max(frameSize.width, minW) + 40, 40);
+        }
+    }
 
     // Ensure output directory exists (portable without <filesystem>)
 #ifdef _WIN32
@@ -79,59 +116,72 @@ int main(int argc, char **argv) {
         return s;
     };
 
+    long long frameIdx = 0;
     while (true) {
         cv::Mat frame;
         if (!cap.read(frame) || frame.empty()) break;
+        ++frameIdx;
+
+        // Process every 'stride'-th frame to save time
+        if (stride > 1 && ((frameIdx - 1) % stride) != 0) continue;
+
+        // Downscale for faster processing if requested
+        cv::Mat proc = frame;
+        if (scale != 1.0) cv::resize(frame, proc, frameSize);
 
         PipelineDebug dbg;
-        cv::Mat out = detector.processFrame(frame, &dbg);
+        PipelineDebug* dbgPtr = enableDebug ? &dbg : nullptr;
+        cv::Mat out = detector.processFrame(proc, dbgPtr);
 
-        // Compose a debug mosaic from extensible steps (with labels)
-        std::vector<cv::Mat> tiles;
-        std::vector<std::string> labels;
-        tiles.reserve(dbg.steps.size() + 1);
-        labels.reserve(dbg.steps.size() + 1);
-        tiles.push_back(showCrosshair ? ld::utils::withCrosshair(frame) : frame);
-        labels.push_back("input");
-        for (const auto &st : dbg.steps) {
-            cv::Mat img = showCrosshair ? ld::utils::withCrosshair(st.image) : st.image;
-            tiles.push_back(img);
-            labels.push_back(st.name);
-        }
-        auto dbgMosaic = ld::utils::mosaicLabeled(tiles, labels, 3);
-        ld::utils::putTextBox(out, "q: quit | space: pause | o: crosshair", {10, 25});
-
-        cv::imshow("Lane Detector", out);
-        if (!dbgMosaic.empty()) cv::imshow("Debug", dbgMosaic);
-
-        // Write step videos (convert single-channel to 3-channel for color writers)
-        if (!frame.empty()) {
-            cv::Mat resized; cv::resize(frame, resized, frameSize);
-            w_input.write(resized);
-        }
-        // Write per-step videos dynamically using dbg.steps
-        for (size_t i = 0; i < dbg.steps.size(); ++i) {
-            const auto &st = dbg.steps[i];
-            cv::Mat img = st.image;
-            if (img.empty()) continue;
-            if (img.channels() == 1) cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
-            if (showCrosshair) img = ld::utils::withCrosshair(img);
-            cv::Mat resized; cv::resize(img, resized, frameSize);
-
-            std::string key = st.name;
-            auto it = stepWriters.find(key);
-            if (it == stepWriters.end()) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf), "output/%02zu_%s.mp4", i+1, sanitize(st.name).c_str());
-                cv::VideoWriter writer = safeWriter(buf, true);
-                stepWriters.emplace(key, std::move(writer));
-                it = stepWriters.find(key);
+        // Debug UI and per-step mosaic only when enabled
+        if (enableDebug) {
+            std::vector<cv::Mat> tiles;
+            std::vector<std::string> labels;
+            tiles.reserve(dbg.steps.size() + 1);
+            labels.reserve(dbg.steps.size() + 1);
+            tiles.push_back(proc); // removed crosshair overlay
+            labels.push_back("input");
+            for (const auto &st : dbg.steps) {
+                cv::Mat img = st.image;
+                tiles.push_back(img);
+                labels.push_back(st.name);
             }
-            if (it->second.isOpened()) it->second.write(resized);
+            auto dbgMosaic = ld::utils::mosaicLabeled(tiles, labels, 3);
+            if (!dbgMosaic.empty()) cv::imshow("Debug", dbgMosaic);
+
+            // Write per-step videos (convert single-channel to 3-channel for color writers)
+            for (size_t i = 0; i < dbg.steps.size(); ++i) {
+                const auto &st = dbg.steps[i];
+                cv::Mat img = st.image;
+                if (img.empty()) continue;
+                if (img.channels() == 1) cv::cvtColor(img, img, cv::COLOR_GRAY2BGR);
+                // removed crosshair overlay
+                cv::Mat resized;
+                if (img.size() != frameSize) cv::resize(img, resized, frameSize); else resized = img;
+
+                std::string key = st.name;
+                auto it = stepWriters.find(key);
+                if (it == stepWriters.end()) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf), "output/%02zu_%s.mp4", i+1, sanitize(st.name).c_str());
+                    cv::VideoWriter writer = safeWriter(buf, true);
+                    stepWriters.emplace(key, std::move(writer));
+                    it = stepWriters.find(key);
+                }
+                if (it->second.isOpened()) it->second.write(resized);
+            }
         }
-        if (!out.empty()) {
-            cv::Mat resized; cv::resize(out, resized, frameSize);
-            w_out.write(resized);
+
+        // Display and output writing on scaled frames to reduce work
+        if (!out.empty()) cv::imshow("Lane Detector", out);
+
+        if (w_input.isOpened()) {
+            // 'proc' is already at frameSize
+            w_input.write(proc);
+        }
+        if (!out.empty() && w_out.isOpened()) {
+            // 'out' is already at frameSize
+            w_out.write(out);
         }
 
         char key = static_cast<char>(cv::waitKey(1));
@@ -140,9 +190,6 @@ int main(int argc, char **argv) {
             // pause until any key
             key = static_cast<char>(cv::waitKey(0));
             if (key == 'q' || key == 27) break;
-        }
-        if (key == 'o' || key == 'O') {
-            showCrosshair = !showCrosshair;
         }
     }
 
