@@ -138,7 +138,7 @@ The lane is correctly found except for when there is a marking in the middle of 
 ### Rain
 Very curvy road, raindrops on the windshield, many reflections due to water on the road.
 
-![Rain GIF](assests/4-rain.gif)
+![Rain GIF](assets/4-rain.gif)
 
 Here we can see the lane jumping and bending a lot. This scenario would definitely need more parameter tuning and maybe additional steps in the pipeline for backup strategies.
 
