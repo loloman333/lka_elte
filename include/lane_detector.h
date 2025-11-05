@@ -33,17 +33,17 @@ namespace ld
             // Edge detection parameters (Canny and Gaussian blur).
             int cannyLow = 50;
             int cannyHigh = 120;
-            int gaussKernel = 5;
+            int gaussKernel = 7;
 
             // Hough Transform parameters for line segments.
             double houghRho = 1.0;
             double houghTheta = CV_PI / 180.0;
-            int houghThreshold = 20;
-            double houghMinLineLength = 100.0;
-            double houghMaxLineGap = 100.0;
+            int houghThreshold = 120;
+            double houghMinLineLength = 50.0;
+            double houghMaxLineGap = 10.0;
 
             // ROI parameters: keep a trapezoid-like area near the bottom.
-            double roiKeepRatio = 0.55; // Fraction of height kept from bottom.
+            double roiKeepRatio = 0.45; // Fraction of height kept from bottom.
             double roiAngleDeg = 110;   // Angle from vertical for side cuts.
 
             // CLAHE parameters to stabilize luminance before edges.
@@ -55,7 +55,7 @@ namespace ld
             double ransacInlierThreshPx = 10.0;
 
             // Seed picking (raycast count in ROI).
-            int seedRayCount = 15;
+            int seedRayCount = 5;
 
             // Line agreement grouping thresholds.
             double agreeSlopeTol = 0.15;
@@ -186,8 +186,8 @@ namespace ld
                                cv::Mat &rightLanePolySm);
 
         // Temporal smoothing parameters and history.
-        double polySmoothAlpha_ = 0.95; // [0..1], lower means stronger smoothing over history.
-        int polyHistoryLen_ = 20;      // History length.
+        double polySmoothAlpha_ = 0.99; // [0..1], lower means stronger smoothing over history.
+        int polyHistoryLen_ = 15;      // History length.
         std::deque<cv::Vec3d> histLeft_;
         std::deque<cv::Vec3d> histRight_;
 

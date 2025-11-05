@@ -15,7 +15,7 @@ services:
     # Provide a video path via env var VIDEO or fallback to /app/data/sample.mp4
     # command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector \"${VIDEO:-/app/data/curvy.mp4}\" "]
     # command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector \"${VIDEO:-/app/data/with_cars.mp4}\" "]
-    command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector --no-debug \"${VIDEO:-/app/data/poc.mp4}\" "]
+    command: ["bash", "-lc", "make -j$(nproc) && ./bin/lane_detector \"${VIDEO:-/app/data/basic.mp4}\" "]
 
 # Notes:
 # - On Linux/X11, run `xhost +local:root` once to allow GUI from containers.
